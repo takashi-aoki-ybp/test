@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Holoeyes Biz - 手の動きで3D操作体験</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/three@0.155.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0/dist/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/handpose@0.0.6/dist/handpose.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Arial', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+        }
+        
+        .demo-container {
+            position: relative;
+            width: 100%;
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .camera-container {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            width: 320px;
+            height: 240px;
+            border-radius: 15px;
+            overflow: hidden;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            z-index: 10;
+        }
+        
+        .camera-feed {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        
+        .canvas-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+        
+        .control-panel {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(255,255,255,0.9);
+            padding: 20px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            z-index: 10;
+        }
+        
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 8px;
+        }
+        
+        .status-active { background: #10b981; }
+        .status-inactive { background: #ef4444; }
+        
+        .three-container {
+            width: 100%;
+            height: 100%;
+            position: relative;
+        }
+        
+        .instructions {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0,0,0,0.8);
+            color: white;
+            padding: 20px;
+            border-radius: 15px;
+            text-align: center;
+            max-width: 600px;
+            z-index: 10;
+        }
+        
+        .loader {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 1.2em;
+            z-index: 100;
+        }
+        
+        .hand-point {
+            position: absolute;
+            width: 8px;
+            height: 8px;
+            background: #ff6b6b;
+            border-radius: 50%;
+            pointer-events: none;
+            z-index: 20;
+        }
+    </style>
+</head>
+<body>
+    <div class="demo-container">
+        <div class="loader" id="loader">
+            <i class="fas fa-spinner fa-spin"></i>
+            <div class="mt-2">AIモデルを読み込み中...</div>
+        </div>
+        
+        <div class="camera-container" id="cameraContainer" style="display: none;">
+            <video id="videoElement" class="camera-feed" autoplay muted></video>
+            <canvas id="canvasOverlay" class="canvas-overlay"></canvas>
+        </div>
+        
+        <div class="control-panel" id="controlPanel" style="display: none;">
+            <div class="text-sm font-bold mb-3">
+                <i class="fas fa-hand-paper text-blue-500"></i> 手の検出状態
+            </div>
+            <div class="mb-2">
+                <span class="status-indicator" id="handStatus"></span>
+                <span id="handStatusText">検出中...</span>
+            </div>
+            <div class="mb-2">
+                <span class="status-indicator" id="cameraStatus"></span>
+                <span id="cameraStatusText">カメラ起動中...</span>
+            </div>
+            <div class="text-xs text-gray-600 mt-3">
+                手をカメラに向けて<br>
+                3Dモデルを操作してください
+            </div>
+        </div>
+        
+        <div class="three-container" id="threeContainer"></div>
+        
+        <div class="instructions" id="instructions" style="display: none;">
+            <h3 class="text-lg font-bold mb-2">
+                <i class="fas fa-magic text-yellow-400"></i> VR体験デモ
+            </h3>
+            <p class="text-sm mb-2">
+                手をカメラに向けると、3D心臓モデルが手の動きに追従します
+            </p>
+            <div class="grid grid-cols-2 gap-4 text-xs">
+                <div>
+                    <i class="fas fa-hand-rock text-red-400"></i> 手を握る: 回転
+                </div>
+                <div>
+                    <i class="fas fa-hand-paper text-blue-400"></i> 手を開く: 拡大
+                </div>
+                <div>
+                    <i class="fas fa-arrows-alt text-green-400"></i> 手を動かす: 移動
+                </div>
+                <div>
+                    <i class="fas fa-eye text-purple-400"></i> 実際のVRでは<br>より詳細な操作が可能
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let scene, camera, renderer, heartModel;
+        let video, canvas, ctx;
+        let handposeModel;
+        let isHandDetected = false;
+        let animationId;
+        let handPosition = { x: 0, y: 0 };
+        let handOpenness = 0.5;
+        
+        // 初期化
+        async function init() {
+            try {
+                // TensorFlow.js設定
+                await tf.ready();
+                
+                // Handposeモデルロード
+                handposeModel = await handpose.load();
+                console.log('Handposeモデルロード完了');
+                
+                // カメラ設定
+                await setupCamera();
+                
+                // Three.js設定
+                setupThreeJS();
+                
+                // UIの表示
+                document.getElementById('loader').style.display = 'none';
+                document.getElementById('cameraContainer').style.display = 'block';
+                document.getElementById('controlPanel').style.display = 'block';
+                document.getElementById('instructions').style.display = 'block';
+                
+                // 手の検出開始
+                detectHands();
+                
+                // レンダリング開始
+                animate();
+                
+            } catch (error) {
+                console.error('初期化エラー:', error);
+                document.getElementById('loader').innerHTML = '<i class="fas fa-exclamation-triangle"></i><div class="mt-2">読み込みエラー</div>';
+            }
+        }
+        
+        // カメラ設定
+        async function setupCamera() {
+            video = document.getElementById('videoElement');
+            canvas = document.getElementById('canvasOverlay');
+            ctx = canvas.getContext('2d');
+            
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { width: 320, height: 240 }
+                });
+                video.srcObject = stream;
+                
+                video.onloadedmetadata = () => {
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    updateStatus('cameraStatus', 'cameraStatusText', true, 'カメラ起動中');
+                };
+                
+            } catch (error) {
+                console.error('カメラアクセスエラー:', error);
+                updateStatus('cameraStatus', 'cameraStatusText', false, 'カメラエラー');
+            }
+        }
+        
+        // Three.js設定
+        function setupThreeJS() {
+            const container = document.getElementById('threeContainer');
+            
+            // シーン作成
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x000011);
+            
+            // カメラ作成
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.z = 5;
+            
+            // レンダラー作成
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            container.appendChild(renderer.domElement);
+            
+            // ライト設定
+            const ambientLight = new THREE.AmbientLight(0x404040, 0.6);
+            scene.add(ambientLight);
+            
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            directionalLight.position.set(1, 1, 1);
+            scene.add(directionalLight);
+            
+            // 心臓モデル（トーラス形状で代用）
+            const geometry = new THREE.TorusGeometry(1, 0.4, 16, 100);
+            const material = new THREE.MeshLambertMaterial({ 
+                color: 0xff6b6b,
+                wireframe: false
+            });
+            heartModel = new THREE.Mesh(geometry, material);
+            
+            // 心臓らしい形状に変形
+            heartModel.scale.set(1.2, 1.0, 0.8);
+            scene.add(heartModel);
+            
+            // パーティクル効果
+            addParticles();
+            
+            // リサイズ対応
+            window.addEventListener('resize', onWindowResize);
+        }
+        
+        // パーティクル追加
+        function addParticles() {
+            const particlesGeometry = new THREE.BufferGeometry();
+            const particlesCount = 1000;
+            const positions = new Float32Array(particlesCount * 3);
+            
+            for (let i = 0; i < particlesCount * 3; i++) {
+                positions[i] = (Math.random() - 0.5) * 20;
+            }
+            
+            particlesGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            
+            const particlesMaterial = new THREE.PointsMaterial({
+                color: 0x88ccff,
+                size: 0.02,
+                transparent: true,
+                opacity: 0.6
+            });
+            
+            const particles = new THREE.Points(particlesGeometry, particlesMaterial);
+            scene.add(particles);
+        }
+        
+        // 手の検出
+        async function detectHands() {
+            if (!video || !handposeModel) return;
+            
+            try {
+                const predictions = await handposeModel.estimateHands(video);
+                
+                // キャンバスクリア
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                
+                if (predictions.length > 0) {
+                    const hand = predictions[0];
+                    
+                    // 手の位置を正規化
+                    const centerX = hand.landmarks[9][0] / canvas.width;
+                    const centerY = hand.landmarks[9][1] / canvas.height;
+                    
+                    handPosition.x = (centerX - 0.5) * 4;
+                    handPosition.y = (0.5 - centerY) * 4;
+                    
+                    // 手の開き具合を計算
+                    const thumbTip = hand.landmarks[4];
+                    const indexTip = hand.landmarks[8];
+                    const distance = Math.sqrt(
+                        Math.pow(thumbTip[0] - indexTip[0], 2) + 
+                        Math.pow(thumbTip[1] - indexTip[1], 2)
+                    );
+                    handOpenness = Math.min(distance / 100, 1.0);
+                    
+                    // 手のランドマーク描画
+                    drawHand(hand.landmarks);
+                    
+                    if (!isHandDetected) {
+                        isHandDetected = true;
+                        updateStatus('handStatus', 'handStatusText', true, '手を検出中');
+                    }
+                    
+                } else {
+                    if (isHandDetected) {
+                        isHandDetected = false;
+                        updateStatus('handStatus', 'handStatusText', false, '手が見つかりません');
+                    }
+                }
+                
+            } catch (error) {
+                console.error('手の検出エラー:', error);
+            }
+            
+            // 継続的に検出
+            setTimeout(detectHands, 50);
+        }
+        
+        // 手のランドマーク描画
+        function drawHand(landmarks) {
+            ctx.strokeStyle = '#ff6b6b';
+            ctx.lineWidth = 2;
+            ctx.fillStyle = '#ff6b6b';
+            
+            // 手の骨格を描画
+            const connections = [
+                [0, 1], [1, 2], [2, 3], [3, 4], // 親指
+                [0, 5], [5, 6], [6, 7], [7, 8], // 人差し指
+                [0, 9], [9, 10], [10, 11], [11, 12], // 中指
+                [0, 13], [13, 14], [14, 15], [15, 16], // 薬指
+                [0, 17], [17, 18], [18, 19], [19, 20], // 小指
+                [5, 9], [9, 13], [13, 17] // 手のひら
+            ];
+            
+            // 線を描画
+            connections.forEach(([start, end]) => {
+                ctx.beginPath();
+                ctx.moveTo(landmarks[start][0], landmarks[start][1]);
+                ctx.lineTo(landmarks[end][0], landmarks[end][1]);
+                ctx.stroke();
+            });
+            
+            // 点を描画
+            landmarks.forEach(([x, y]) => {
+                ctx.beginPath();
+                ctx.arc(x, y, 3, 0, 2 * Math.PI);
+                ctx.fill();
+            });
+        }
+        
+        // ステータス更新
+        function updateStatus(statusId, textId, isActive, text) {
+            const statusElement = document.getElementById(statusId);
+            const textElement = document.getElementById(textId);
+            
+            statusElement.className = `status-indicator ${isActive ? 'status-active' : 'status-inactive'}`;
+            textElement.textContent = text;
+        }
+        
+        // アニメーション
+        function animate() {
+            animationId = requestAnimationFrame(animate);
+            
+            if (heartModel) {
+                // 手の動きに基づく回転
+                if (isHandDetected) {
+                    heartModel.rotation.y += (handPosition.x * 0.01 - heartModel.rotation.y) * 0.1;
+                    heartModel.rotation.x += (handPosition.y * 0.01 - heartModel.rotation.x) * 0.1;
+                    
+                    // 手の開き具合に基づくスケール
+                    const targetScale = 1 + handOpenness * 0.5;
+                    heartModel.scale.x += (targetScale - heartModel.scale.x) * 0.1;
+                    heartModel.scale.y += (targetScale - heartModel.scale.y) * 0.1;
+                    heartModel.scale.z += (targetScale - heartModel.scale.z) * 0.1;
+                    
+                    // 位置の調整
+                    heartModel.position.x += (handPosition.x * 0.5 - heartModel.position.x) * 0.1;
+                    heartModel.position.y += (handPosition.y * 0.5 - heartModel.position.y) * 0.1;
+                } else {
+                    // 自動回転
+                    heartModel.rotation.y += 0.01;
+                    heartModel.rotation.x += 0.005;
+                }
+                
+                // 鼓動効果
+                const time = Date.now() * 0.003;
+                const heartbeat = Math.sin(time) * 0.1 + 1;
+                heartModel.material.emissive.setHex(Math.sin(time) > 0 ? 0x220000 : 0x000000);
+            }
+            
+            renderer.render(scene, camera);
+        }
+        
+        // ウィンドウリサイズ対応
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+        
+        // 初期化開始
+        init();
+    </script>
+</body>
+</html>
